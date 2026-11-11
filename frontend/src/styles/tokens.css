@@ -1,0 +1,35 @@
+/* 设计 token：暗色「值班管制台」。
+   近黑墨绿底 + 琥珀告警色 + 横向分隔线 + 左侧状态条；全部 oklch，禁止组件内硬编码颜色。 */
+:root {
+  --color-rail: oklch(0.22 0.02 160);      /* 页面底 */
+  --color-deck: oklch(0.262 0.024 160);    /* 抬升面 */
+  --color-panel: oklch(0.243 0.022 160);   /* 面板底 */
+  --color-sunken: oklch(0.195 0.018 160);  /* 表头/代码块 */
+  --color-line: oklch(0.35 0.024 160);     /* 1px 分隔线 */
+  --color-line-soft: oklch(0.3 0.02 160);
+  --color-ink: oklch(0.93 0.012 150);      /* 正文 */
+  --color-dim: oklch(0.68 0.014 155);      /* 次级文字 */
+  --color-faint: oklch(0.53 0.012 155);    /* 注释/占位 */
+  --color-amber: oklch(0.79 0.135 76);     /* 告警/主操作/运行中 */
+  --color-amber-ink: oklch(0.24 0.03 76);  /* 琥珀底上的字 */
+  --color-amber-soft: oklch(0.36 0.055 76);
+  --color-danger: oklch(0.63 0.19 28);     /* breaking / 拒绝 */
+  --color-ok: oklch(0.74 0.09 168);        /* 成功 / 兼容 */
+  --color-forward: oklch(0.71 0.055 282);  /* forward 兼容（低饱和，非霓虹） */
+  --color-warn: oklch(0.75 0.115 60);      /* 延迟 / 部分成功 */
+
+  --font-display: 'Space Grotesk', 'Noto Sans SC', 'PingFang SC', 'Hiragino Sans GB', sans-serif;
+  --font-mono: 'IBM Plex Mono', 'SFMono-Regular', 'Menlo', 'Consolas', monospace;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  --rail-w: 216px;
+  --top-h: 54px;
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+}
