@@ -24,7 +24,7 @@ export interface User {
 
 export type CdcOp = 'insert' | 'update' | 'delete';
 export type StreamStatus = 'healthy' | 'lagging' | 'paused' | 'error';
-export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled';
+export type RunStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'canceled' | 'blocked';
 export type CompatLevel = 'full' | 'backward' | 'forward' | 'breaking';
 export type RejectReason = 'schema_mismatch' | 'pk_missing' | 'parse_error' | 'type_conflict';
 export type RejectStatus = 'pending' | 'replayed' | 'dismissed';
@@ -132,6 +132,35 @@ export interface AmountAuditItem {
   delta_sum: number;
 }
 
+export interface BlockingField {
+  event_id: string;
+  lsn: number;
+  pk: string | null;
+  field: string;
+  reason: 'unknown_column' | 'type_incompatible' | 'required_missing' | 'not_null_violation' | string;
+  reason_label: string;
+  detail: string;
+  expected_type: string | null;
+  actual_type: string | null;
+}
+
+export interface PublishDetail {
+  published: boolean;
+  reason: string | null;
+  detail: string;
+  blocking_fields: BlockingField[];
+  target_table?: string;
+  guarded_upserts?: number;
+  stale_upserts_skipped?: number;
+  guarded_deletes?: number;
+  stale_deletes_skipped?: number;
+  row_count_before?: number | null;
+  row_count_after?: number | null;
+  target_columns?: string[];
+  target_snapshot_truncated?: boolean;
+  target_rows?: Array<Record<string, unknown>>;
+}
+
 export interface MergeResult {
   window: { start: number; end: number; size: number };
   strategy: string;
@@ -145,6 +174,8 @@ export interface MergeResult {
     rebuilt: boolean;
     values: Record<string, unknown>;
   }>;
+  tombstones?: Array<{ pk: string; last_lsn: number }>;
+  applied_events?: Array<Record<string, unknown>>;
   conflicts: Array<{
     pk: string;
     field: string;
@@ -159,6 +190,7 @@ export interface MergeResult {
   digest: string;
   idempotent?: boolean;
   executed_by?: string;
+  publish?: PublishDetail | null;
 }
 
 export interface MergeRun {
@@ -183,12 +215,16 @@ export interface MergeRun {
   watermark_after_display: string;
   duration_ms: number;
   result_digest: string | null;
+  published: boolean | null;
+  target_rows_before: number | null;
+  target_rows_after: number | null;
   error_message: string | null;
   created_at: string | null;
   started_at: string | null;
   finished_at: string | null;
   idempotent?: boolean;
   result?: MergeResult | null;
+  publish?: PublishDetail | null;
 }
 
 export interface SchemaField {

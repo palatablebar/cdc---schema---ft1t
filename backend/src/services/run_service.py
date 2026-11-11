@@ -140,6 +140,7 @@ def run_detail(db: Session, run_id: str) -> dict[str, Any]:
     names = _stream_names(db)
     payload = _serialize(db, run, names)
     payload["result"] = run.result_json
+    payload["publish"] = run.publish_json
     return payload
 
 
@@ -147,7 +148,7 @@ def _serialize(db: Session, run: MergeRun, names: dict[str, str]) -> dict[str, A
     from src.schemas.run import serialize_run
 
     idempotent = None
-    if run.status == RunStatus.SUCCEEDED.value and run.result_digest:
+    if run.status in (RunStatus.SUCCEEDED.value, RunStatus.BLOCKED.value) and run.result_digest:
         twin = (
             db.query(MergeRun)
             .filter(
@@ -155,7 +156,7 @@ def _serialize(db: Session, run: MergeRun, names: dict[str, str]) -> dict[str, A
                 MergeRun.window_start_lsn == run.window_start_lsn,
                 MergeRun.window_end_lsn == run.window_end_lsn,
                 MergeRun.result_digest == run.result_digest,
-                MergeRun.status == RunStatus.SUCCEEDED.value,
+                MergeRun.status.in_([RunStatus.SUCCEEDED.value, RunStatus.BLOCKED.value]),
                 MergeRun.id != run.id,
             )
             .order_by(MergeRun.created_at.asc())

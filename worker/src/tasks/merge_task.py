@@ -19,6 +19,7 @@ from src.models.merge_run import MergeRun
 from src.models.merge_target import MergeTarget
 from src.models.rejected_event import RejectedEvent
 from src.services.merge_engine import compute_merge
+from src.services.target_publisher import publish_window
 from src.utils.logger import get_logger
 from src.utils.redis_client import get_redis
 
@@ -102,8 +103,10 @@ def merge_run_task(self, run_id: str) -> dict[str, Any]:
                 window_start=run.window_start_lsn,
                 window_end=run.window_end_lsn,
             )
-            _progress(run_id, "persisting", result["counts"])
+            result["stream_id"] = str(stream.id)
+            _progress(run_id, "gating", {"events": len(payload)})
 
+            # 同窗口 + 同 digest 的历史终态运行（含 blocked）即证明重跑结果唯一
             twin = (
                 db.query(func.count(MergeRun.id))
                 .filter(
@@ -111,7 +114,7 @@ def merge_run_task(self, run_id: str) -> dict[str, Any]:
                     MergeRun.window_start_lsn == run.window_start_lsn,
                     MergeRun.window_end_lsn == run.window_end_lsn,
                     MergeRun.result_digest == result["digest"],
-                    MergeRun.status == RunStatus.SUCCEEDED.value,
+                    MergeRun.status.in_([RunStatus.SUCCEEDED.value, RunStatus.BLOCKED.value]),
                     MergeRun.id != run.id,
                 )
                 .scalar()
@@ -166,34 +169,78 @@ def merge_run_task(self, run_id: str) -> dict[str, Any]:
             run.upserted_count = counts["upserted"]
             run.watermark_after = result["watermark_after"]
             run.result_digest = result["digest"]
-            run.result_json = result
             run.duration_ms = max(1, int((time.perf_counter() - started) * 1000))
-            run.status = RunStatus.SUCCEEDED.value
-            run.finished_at = datetime.now(timezone.utc)
 
-            # 只有窗口与水位线连续时才推进水位线；有空洞就停在水位线处
-            if run.window_start_lsn <= int(stream.watermark_lsn) + 1:
-                stream.watermark_lsn = max(int(stream.watermark_lsn), int(result["watermark_after"]))
-            stream.status = "healthy" if int(stream.max_lsn) <= int(stream.watermark_lsn) else stream.status
+            # ---- 数仓发布：先过整窗 schema gate，再在单事务内带 LSN 守卫写入 ----
+            publish_detail: dict[str, Any]
+            if target is None:
+                publish_detail = {
+                    "published": False,
+                    "reason": "no_target",
+                    "detail": "该变更流未匹配到数仓目标表，结果仅保留在运行记录中",
+                    "blocking_fields": [],
+                }
+            elif strategy == MergeStrategy.APPEND.value:
+                publish_detail = {
+                    "published": False,
+                    "reason": "append_unsupported",
+                    "detail": "append 策略仅做追加计数演示，不向 upsert 目标表发布",
+                    "blocking_fields": [],
+                }
+            else:
+                _progress(run_id, "publishing", {"target": target.target_table})
+                publish_detail = publish_window(db, target, stream.id, result)
+            result["publish"] = publish_detail
+
+            run.published = bool(publish_detail.get("published"))
+            run.publish_json = publish_detail
+            run.target_rows_before = publish_detail.get("row_count_before")
+            run.target_rows_after = publish_detail.get("row_count_after")
+            run.result_json = result
+
+            # 只有 gate 拦截 / 目标表缺失这类“想发发不出”的情况才是 blocked；
+            # no_target / append 演示模式属于未配置发布，运行本身仍算 succeeded。
+            hard_block = (not run.published) and publish_detail.get("reason") in {
+                "schema_gate",
+                "target_missing",
+            }
+            if hard_block:
+                # gate 阻塞：整窗没有任何写入，水位线不推进，等待目标表版本对齐后重跑同一窗口
+                run.status = RunStatus.BLOCKED.value
+                run.error_message = publish_detail.get("detail")
+            else:
+                run.status = RunStatus.SUCCEEDED.value
+                run.error_message = None
+                # 只有窗口与水位线连续时才推进水位线；有空洞就停在水位线处
+                if run.window_start_lsn <= int(stream.watermark_lsn) + 1:
+                    stream.watermark_lsn = max(int(stream.watermark_lsn), int(result["watermark_after"]))
+                stream.status = "healthy" if int(stream.max_lsn) <= int(stream.watermark_lsn) else stream.status
+            run.finished_at = datetime.now(timezone.utc)
             db.commit()
 
-            _progress(run_id, "done", counts)
+            _progress(run_id, "blocked" if hard_block else "done", counts)
             logger.info(
-                "merge done run=%s stream=%s processed=%s duplicate=%s rejected=%s upserted=%s idempotent=%s",
+                "merge finished run=%s stream=%s status=%s processed=%s duplicate=%s rejected=%s "
+                "published=%s upserts=%s stale_skipped=%s idempotent=%s",
                 run_id,
                 stream.name,
+                run.status,
                 counts["processed"],
                 counts["duplicate"],
                 counts["rejected"],
-                counts["upserted"],
+                run.published,
+                publish_detail.get("guarded_upserts"),
+                publish_detail.get("stale_upserts_skipped"),
                 result["idempotent"],
             )
             return {
                 "run_id": run_id,
                 "status": run.status,
                 "counts": counts,
+                "published": run.published,
                 "idempotent": result["idempotent"],
                 "rejected_created": rejected_created,
+                "blocking_fields": publish_detail.get("blocking_fields", []),
             }
         except Exception as exc:  # noqa: BLE001 - 任务失败必须落库
             db.rollback()

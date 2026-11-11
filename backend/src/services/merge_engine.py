@@ -11,7 +11,8 @@
   4. 金额守恒校验：同 PK 的 amount 满足 `insert 值 + Σ(after-before) == 最终值`；
   5. 水位线 = 窗口内最小未到达 LSN 的前一个 LSN（有空洞时如实停在水位线处）。
 
-输出：计数、最终行、冲突明细、金额校验、digest（用于幂等判定）。
+输出：计数、最终行、本窗 tombstone、参与归并的事件明细（供发布层做整窗 schema gate）、
+冲突明细、重复明细、金额校验、digest（用于幂等判定）。
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ import hashlib
 import json
 from typing import Any
 
-from src.constants.enums import MergeStrategy
+from src.constants.enums import CdcOp, MergeStrategy
 from src.utils.lsn import LsnWindow, first_gap
 
 
@@ -48,6 +49,7 @@ def compute_merge(
     seen_lsns: set[int] = set()
     duplicate_events: list[dict[str, Any]] = []
     rejected_events: list[dict[str, Any]] = []
+    applied_events: list[dict[str, Any]] = []
 
     rows: dict[str, dict[str, Any]] = {}
     tombstones: dict[str, dict[str, Any]] = {}
@@ -107,7 +109,7 @@ def compute_merge(
         after = dict(event.get("after_json") or {})
         before = dict(event.get("before_json") or {})
 
-        if op == "insert":
+        if op == CdcOp.INSERT.value:
             if pk in tombstones:
                 rebuilt += 1
                 tombstones.pop(pk)
@@ -121,7 +123,7 @@ def compute_merge(
                 inserted += 1
                 amount_audit[pk] = {"base": _numeric(after.get("amount")), "deltas": [], "mismatch": False}
 
-        elif op == "update":
+        elif op == CdcOp.UPDATE.value:
             if pk in tombstones:
                 rebuilt += 1
                 tombstones.pop(pk)
@@ -141,7 +143,7 @@ def compute_merge(
                 if before_amount is not None and after_amount is not None:
                     audit["deltas"].append(round(after_amount - before_amount, 4))
 
-        elif op == "delete":
+        elif op == CdcOp.DELETE.value:
             rows.pop(pk, None)
             tombstones[pk] = {"pk": pk, "last_lsn": lsn}
             deleted += 1
@@ -155,6 +157,19 @@ def compute_merge(
                     "detail": f"未知操作类型 {op!r}",
                 }
             )
+            continue
+
+        # 通过全部前置校验、真正参与行合并的事件（供发布层做整窗 schema gate）
+        applied_events.append(
+            {
+                "event_id": str(event.get("id", "")),
+                "lsn": lsn,
+                "pk": pk,
+                "op": op,
+                "before": before,
+                "after": after,
+            }
+        )
 
     for pk, audit in amount_audit.items():
         if audit["base"] is None:
@@ -227,6 +242,11 @@ def compute_merge(
         "watermark_after": watermark_after,
         "gap": gap,
         "rows": result_rows,
+        "tombstones": sorted(
+            ({"pk": pk, "last_lsn": item["last_lsn"]} for pk, item in tombstones.items()),
+            key=lambda item: item["pk"],
+        ),
+        "applied_events": applied_events,
         "conflicts": conflicts,
         "duplicates": duplicate_events,
         "rejected": rejected_events,

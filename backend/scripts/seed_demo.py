@@ -35,6 +35,7 @@ from src.models.rejected_event import RejectedEvent
 from src.models.schema_version import SchemaVersion
 from src.models.user import User
 from src.services.merge_engine import compute_merge
+from src.services.target_publisher import publish_window
 from src.utils.password import hash_password
 
 DEMO_PASSWORD = "Demo@2026"
@@ -78,6 +79,26 @@ CUSTOMERS_SCHEMA_V1 = [
 
 CREATED = 0
 SKIPPED = 0
+
+
+class _NestedSession:
+    """把 publisher 的 db.rollback() 收窄成 savepoint 回滚。
+
+    seed 整体在一个外层事务里运行；发布失败时只回滚发布 SAVEPOINT，
+    不能把前面 seed 的账号/事件一并回滚。worker 用的是独立 session_scope，
+    真 rollback 语义不受影响。
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._savepoint = inner.begin_nested()
+
+    def rollback(self) -> None:
+        self._savepoint.rollback()
+        self._savepoint = self._inner.begin_nested()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
 
 
 def _log(kind: str, entity: str, key: str) -> None:
@@ -250,6 +271,64 @@ def arrival_order(unique_count: int) -> list[int]:
         i, j = order.index(left), order.index(right)
         order[i], order[j] = order[j], order[i]
     return order
+
+
+def build_orders_breaking_events() -> list[dict[str, Any]]:
+    """演示整窗阻塞：3 条已切到 schema v2 的事件，目标表还停在无 channel 列的旧版。"""
+    return [
+        {
+            "lsn": 1,
+            "op": CdcOp.INSERT.value,
+            "pk_value": "ORD-BLOCK-001",
+            "before": None,
+            "after": {
+                "order_id": "ORD-BLOCK-001",
+                "member_id": "M-0101",
+                "amount": 320.5,
+                "qty": 2,
+                "status": "paid",
+                "updated_at": "2026-11-09T10:00:00",
+                "channel": "app",
+            },
+            "reject_reason": None,
+            "reject_detail": None,
+        },
+        {
+            "lsn": 2,
+            "op": CdcOp.UPDATE.value,
+            "pk_value": "ORD-BLOCK-002",
+            "before": None,
+            "after": {
+                "order_id": "ORD-BLOCK-002",
+                "member_id": "M-0102",
+                "amount": 99.0,
+                "qty": 1,
+                "status": "pending",
+                "updated_at": "2026-11-09T10:05:00",
+                "channel": "mini_program",
+            },
+            "reject_reason": None,
+            "reject_detail": None,
+        },
+        {
+            # 同时演示类型不兼容：amount 收到带货币符号的字符串
+            "lsn": 3,
+            "op": CdcOp.UPDATE.value,
+            "pk_value": "ORD-BLOCK-003",
+            "before": None,
+            "after": {
+                "order_id": "ORD-BLOCK-003",
+                "member_id": "M-0103",
+                "amount": "¥560.00",
+                "qty": 3,
+                "status": "paid",
+                "updated_at": "2026-11-09T10:10:00",
+                "channel": "web",
+            },
+            "reject_reason": None,
+            "reject_detail": None,
+        },
+    ]
 
 
 def build_customers_events() -> list[dict[str, Any]]:
@@ -449,6 +528,12 @@ def seed_targets(db) -> dict[str, MergeTarget]:
     specs = [
         ("orders_dw", "dw.orders_dw", "order_id", "orders 流落地表：按 order_id upsert，金额为业务口径的最终值"),
         ("customers_dw", "dw.customers_dw", "customer_id", "customers 流落地表：维表，按 customer_id upsert"),
+        (
+            "orders_breaking_dw",
+            "dw.orders_breaking_dw",
+            "order_id",
+            "演示整窗阻塞：目标表停留在无 channel 列的旧 schema，v2 事件发布时被 gate 拦截",
+        ),
     ]
     result: dict[str, MergeTarget] = {}
     for name, table, pk, description in specs:
@@ -513,7 +598,14 @@ def seed_merge_run(db, stream: ChangeStream, target: MergeTarget) -> MergeRun | 
         window_start=1,
         window_end=37,
     )
+    result["stream_id"] = str(stream.id)
     finished = datetime.now(timezone.utc)
+
+    # 与 worker 走同一条发布链路：整窗 gate + 单事务 LSN 守卫写入 dw 目标表
+    publish_detail = publish_window(_NestedSession(db), target, stream.id, result)
+    result["publish"] = publish_detail
+    result["triggered_by_label"] = "seed"
+    result["idempotent"] = False
 
     counts = result["counts"]
     run = MergeRun(
@@ -521,7 +613,7 @@ def seed_merge_run(db, stream: ChangeStream, target: MergeTarget) -> MergeRun | 
         target_id=target.id,
         window_start_lsn=1,
         window_end_lsn=37,
-        status=RunStatus.SUCCEEDED.value,
+        status=RunStatus.SUCCEEDED.value if publish_detail.get("published") else RunStatus.BLOCKED.value,
         watermark_before=0,
         received_count=counts["received"],
         processed_count=counts["processed"],
@@ -534,16 +626,136 @@ def seed_merge_run(db, stream: ChangeStream, target: MergeTarget) -> MergeRun | 
         watermark_after=result["watermark_after"],
         duration_ms=max(1, int((finished - started).total_seconds() * 1000)),
         result_digest=result["digest"],
-        result_json={**result, "triggered_by_label": "seed", "idempotent": False},
+        result_json=result,
+        published=bool(publish_detail.get("published")),
+        publish_json=publish_detail,
+        target_rows_before=publish_detail.get("row_count_before"),
+        target_rows_after=publish_detail.get("row_count_after"),
         created_at=finished,
         started_at=started,
         finished_at=finished,
     )
     db.add(run)
     db.flush()
-    stream.watermark_lsn = result["watermark_after"]
+    if publish_detail.get("published"):
+        stream.watermark_lsn = result["watermark_after"]
     db.commit()
-    _created("MergeRun", f"{stream.name}:[1,37] upsert={counts['upserted']}")
+    _created(
+        "MergeRun",
+        f"{stream.name}:[1,37] upsert={counts['upserted']} published={run.published}",
+    )
+    return run
+
+
+def seed_breaking_demo(
+    db,
+    targets: dict[str, MergeTarget],
+) -> MergeRun | None:
+    """整窗阻塞演示：v2 事件流 → 旧版目标表，gate 拦截且目标表保持 0 行。"""
+    stream = seed_stream(
+        db,
+        {
+            "name": "orders_breaking",
+            "source_db": "shop_mysql",
+            "source_table": "shop.orders",
+            "pk_column": "order_id",
+            "status": StreamStatus.ERROR.value,
+            "description": "schema 演进阻塞演示：上游已切 v2（含 channel），数仓目标表仍是旧版结构",
+            "owner_team": "北岸生活 · 交易平台组",
+        },
+    )
+    seed_events(db, stream, build_orders_breaking_events(), [1, 2, 3], [])
+    seed_schema_versions(
+        db,
+        stream,
+        [
+            ("v1", ORDERS_SCHEMA_V1, "order_id PK; amount numeric(14,2); status text NOT NULL", "dba@cdc.local"),
+            ("v2", ORDERS_SCHEMA_V2, "新增 channel text；amount 收窄为 numeric(12,2)", "dba@cdc.local"),
+        ],
+    )
+
+    existing = (
+        db.query(MergeRun)
+        .filter(
+            MergeRun.stream_id == stream.id,
+            MergeRun.triggered_by.is_(None),
+            MergeRun.window_start_lsn == 1,
+            MergeRun.window_end_lsn == 3,
+        )
+        .order_by(MergeRun.created_at.asc())
+        .first()
+    )
+    if existing is not None:
+        _skipped("MergeRun", "orders_breaking:blocked-run")
+        return existing
+
+    events = (
+        db.query(CdcEvent)
+        .filter(CdcEvent.stream_id == stream.id)
+        .order_by(CdcEvent.lsn.asc(), CdcEvent.received_seq.asc())
+        .all()
+    )
+    payload = [
+        {
+            "id": str(row.id),
+            "lsn": row.lsn,
+            "received_seq": row.received_seq,
+            "op": row.op,
+            "pk_value": row.pk_value,
+            "before_json": row.before_json,
+            "after_json": row.after_json,
+            "reject_reason": row.reject_reason,
+            "reject_detail": row.reject_detail,
+        }
+        for row in events
+    ]
+    result = compute_merge(
+        payload,
+        pk_column=stream.pk_column,
+        strategy=MergeStrategy.UPSERT.value,
+        window_start=1,
+        window_end=3,
+    )
+    result["stream_id"] = str(stream.id)
+    publish_detail = publish_window(_NestedSession(db), targets["orders_breaking_dw"], stream.id, result)
+    result["publish"] = publish_detail
+    result["idempotent"] = False
+    result["triggered_by_label"] = "seed"
+
+    counts = result["counts"]
+    started = datetime.now(timezone.utc)
+    run = MergeRun(
+        stream_id=stream.id,
+        target_id=targets["orders_breaking_dw"].id,
+        window_start_lsn=1,
+        window_end_lsn=3,
+        status=RunStatus.BLOCKED.value,
+        watermark_before=0,
+        received_count=counts["received"],
+        processed_count=counts["processed"],
+        duplicate_count=counts["duplicate"],
+        rejected_count=counts["rejected"],
+        inserted_count=counts["inserted"],
+        updated_count=counts["updated"],
+        deleted_count=counts["deleted"],
+        upserted_count=counts["upserted"],
+        watermark_after=0,
+        result_digest=result["digest"],
+        result_json=result,
+        published=False,
+        publish_json=publish_detail,
+        target_rows_before=publish_detail.get("row_count_before"),
+        target_rows_after=publish_detail.get("row_count_after"),
+        created_at=started,
+        started_at=started,
+        finished_at=started,
+    )
+    db.add(run)
+    db.flush()
+    _created(
+        "MergeRun",
+        f"orders_breaking:[1,3] blocked blocking_fields={len(publish_detail.get('blocking_fields', []))}",
+    )
     return run
 
 
@@ -692,6 +904,7 @@ def seed_all() -> dict[str, Any]:
 
         targets = seed_targets(db)
         run = seed_merge_run(db, orders, targets["orders_dw"])
+        blocked_run = seed_breaking_demo(db, targets)
 
         # 拒绝事件要在 run 之后落，才能带上 run_id
         seed_rejected(db, orders, run)

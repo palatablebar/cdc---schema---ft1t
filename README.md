@@ -23,7 +23,9 @@
 
 - **事件流看板**：流列表、水位线、积压量、按 op 的事件分布、最近运行。
 - **事件浏览**：按 op/拒绝标记筛选，按 LSN 序或到达序排列，单事件 before/after 字段级 diff（后端计算）。
-- **归并运行**：选 LSN 窗口 → 后端建 run → Celery worker 执行合并 → 结果落库 → 前端轮询结果。
+- **归并运行**：选 LSN 窗口 → 后端建 run → Celery worker 执行合并 → **整窗 schema gate** → 单事务带 LSN 守卫写入 `dw` 目标表 → 结果落库 → 前端轮询结果。
+- **数仓发布**：归并结果真实物理写入目标表（不再只存 `result_json`）。每条目标行带 `_merge_lsn` 位点列，重复投递/迟到旧事件的位点不新于当前值时整行 no-op；同窗口重跑得到唯一结果。
+- **整窗阻塞**：任一事件字段与目标表实际列不兼容（缺列/类型不兼容/非空违约）时，状态置为 `blocked`，**整窗不发布、目标表零改动、水位线不推进**，运行详情逐条列出阻塞字段。
 - **拒绝与重放**：4 类拒绝原因（`schema_mismatch / pk_missing / parse_error / type_conflict`），按原因做真实载荷修复后重放。
 - **schema 演进**：字段级 diff → 兼容等级（`full/backward/forward/breaking`）→ 前滚 SQL / 预检 SQL / 回滚 SQL / 发布步骤。
 - **横切**：JWT 三角色 RBAC、审计日志、Redis 滑动窗口限流（`runs` 桶 10 次/分钟）。
@@ -54,6 +56,16 @@
 - 兼容口径：**backward** = 新 schema 能读旧数据；**forward** = 旧 schema 能读新数据；**breaking** = 都不成立。汇总取最差；`backward + forward` 混合也判 breaking（方向冲突）。
 - 输出：逐条 `compat`、汇总 `compat_level`、受影响列、前滚 SQL（含 `ADD COLUMN ... DEFAULT`、`ALTER COLUMN ... TYPE ... USING`）、预检 SQL、回滚 SQL、发布步骤。
 - demo 数据：orders 流 `v1 → v2` = `amount numeric(14,2) → numeric(12,2)`（type_narrow / **breaking**）+ 新增 `channel text`（add_nullable / **backward**），即 1 条 breaking + 1 条 backward。
+
+### 算法 3：整窗 schema gate + 事务化数仓发布
+
+`backend/src/services/target_publisher.py`（worker 与 seed 共用同一条发布链路）
+
+- **schema gate（发布前，无写入）**：读目标表 `information_schema` 的真实物理列，对窗口内**每一条参与归并的事件**逐字段检查——目标表缺列（`unknown_column`）、值与列类型不兼容（`type_incompatible`）、非空列收到 NULL（`not_null_violation`）、insert 缺必填列（`required_missing`）。任一命中即整窗判 `blocked`，返回**全部**阻塞字段（event/lsn/pk/field/原因/期望与实际类型），不执行任何 DML。
+- **位点守卫（最新位点为准）**：目标表新增 `_merge_lsn bigint` 列，记录每行最后一次生效事件的 LSN。upsert 走 `INSERT ... ON CONFLICT DO UPDATE ... WHERE _merge_lsn IS NULL OR _merge_lsn < :lsn`，delete 走 `DELETE ... WHERE _merge_lsn <= :lsn`。重复投递与迟到旧事件位点不新于当前值时整行 no-op，当前值不会被回退。
+- **整窗原子**：所有 upsert/delete 在同一事务内完成，写入阶段异常整体回滚，目标表不留半批数据；运行记录里的 `target_rows_before / target_rows_after` 与目标表快照均为发布后回读的真实内容。
+- **重跑唯一**：同一窗口事件集合固定 → digest 相同；重跑时全部行被守卫跳过，物理表内容、行数、digest 三者保持不变，运行详情标记「幂等」。
+- demo 数据：`orders` 流窗口发布到 `dw.orders_dw`（18 行）；`orders_breaking` 流（上游已切含 `channel` 的 v2）发布到停留在旧结构的 `dw.orders_breaking_dw`，整窗被 gate 拦截、目标表保持 0 行。
 
 ## 4. 快速启动
 
@@ -160,8 +172,8 @@ gb-547/
 
 ## 11. 已知边界
 
-- 目标表 `dw.orders_dw` / `dw.customers_dw` 只建了 DDL，归并结果以 `merge_runs.result_json` 的落账行形式持久化，**没有真写 dw 表**（本 demo 的重点是算法与判定，不是物理写入）。
-- `delete` 事件在 seed 数据中为 0 条（演示窗口内全为 insert/update），算法的 tombstone/rebuild 分支有单测级代码但未被 demo 数据触发。
+- 目标表 `dw.orders_dw` / `dw.customers_dw` / `dw.orders_breaking_dw` 由迁移建表，归并结果经 schema gate 后在单事务内真实写入（带 `_merge_lsn` 位点列）；目标表 DDL 仍需人工/迁移维护，发布只按既有物理列做兼容性判定，不自动 ALTER TABLE。
+- `delete` 事件在 seed 数据中为 0 条（演示窗口内全为 insert/update），算法的 tombstone/rebuild 与守卫 delete 分支由 `scripts/it_publish_check.py` 的集成用例覆盖。
 - 事件来源是数据库表，不是真的 Kafka 消费者。
 
 ## License

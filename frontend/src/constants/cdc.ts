@@ -8,12 +8,13 @@ export const STREAM_STATUS: Record<StreamStatus, { label: string; tone: 'ok' | '
   error: { label: '异常', tone: 'danger' },
 };
 
-export const RUN_STATUS: Record<RunStatus, { label: string; tone: 'ok' | 'amber' | 'danger' | 'muted'; running?: boolean }> = {
+export const RUN_STATUS: Record<RunStatus, { label: string; tone: 'ok' | 'amber' | 'danger' | 'warn' | 'muted'; running?: boolean }> = {
   queued: { label: '排队中', tone: 'amber', running: true },
   running: { label: '归并中', tone: 'amber', running: true },
   succeeded: { label: '成功', tone: 'ok' },
   failed: { label: '失败', tone: 'danger' },
   canceled: { label: '已取消', tone: 'muted' },
+  blocked: { label: '阻塞未发布', tone: 'danger' },
 };
 
 export const CDC_OP: Record<CdcOp, { label: string; tone: 'ok' | 'amber' | 'danger' }> = {

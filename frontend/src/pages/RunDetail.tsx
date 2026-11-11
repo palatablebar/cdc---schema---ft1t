@@ -5,6 +5,7 @@ import { MetricStrip } from '../components/common/MetricStrip';
 import { PanelHead } from '../components/common/PanelHead';
 import { StatusPill } from '../components/common/StatusPill';
 import { EmptyState } from '../components/common/EmptyState';
+import { TargetPublishPanel } from '../components/common/TargetPublishPanel';
 import { RUN_STATUS } from '../constants/cdc';
 import { useRunPolling } from '../hooks/useRunPolling';
 import type { MergeRun } from '../types/models';
@@ -51,6 +52,8 @@ export const RunDetailPage = () => {
 
   const result = run.result;
   const counts = result?.counts;
+  const publish = run.publish ?? result?.publish ?? null;
+  const isBlocked = run.status === 'blocked';
 
   return (
     <div>
@@ -75,7 +78,14 @@ export const RunDetailPage = () => {
 
       {isRunning ? (
         <div className="notice" style={{ marginBottom: 12 }}>
-          worker 正在处理这条窗口：按 LSN 排序 → 去重 → 应用变更 → 金额校验。页面每 1.2s 自动刷新。
+          worker 正在处理这条窗口：按 LSN 排序 → 去重 → 应用变更 → 金额校验 → schema gate → 事务发布。页面每 1.2s 自动刷新。
+        </div>
+      ) : null}
+
+      {isBlocked ? (
+        <div className="notice danger" style={{ marginBottom: 12 }} data-testid="run-blocked-banner">
+          整窗归并已计算完成，但有字段与目标表版本不兼容，<strong>本次没有向目标表写入任何数据</strong>
+          （目标表保持发布前内容，水位线不推进）。阻塞字段见下方「数仓目标表」面板，对齐目标表 DDL 或修复事件后重跑同一窗口即可。
         </div>
       ) : null}
 
@@ -98,6 +108,15 @@ export const RunDetailPage = () => {
             note: '进拒绝队列',
           },
           { label: '落账行', value: String(run.upserted_count), tone: 'ok', note: '窗口结束时的最终行数' },
+          {
+            label: '数仓发布',
+            value: run.published === null ? '—' : run.published ? '已入库' : '未发布',
+            tone: run.published === false ? 'danger' : run.published ? 'ok' : undefined,
+            note:
+              run.target_rows_before !== null && run.target_rows_before !== undefined
+                ? `目标表 ${run.target_rows_before} → ${run.target_rows_after} 行`
+                : '目标表无写入',
+          },
           { label: '耗时', value: formatMs(run.duration_ms), note: result?.executed_by === 'worker' ? 'worker 执行' : 'seed 历史运行' },
         ]}
       />
@@ -136,12 +155,15 @@ export const RunDetailPage = () => {
                 digest <span className="code-inline">{run.result_digest ?? '—'}</span>
               </div>
               <div style={{ marginTop: 6 }} className="faint">
-                同一窗口重复运行会得到相同 digest，可用于验证「重复投递不会让金额翻倍」。
+                同一窗口重复运行会得到相同 digest，可用于验证「重复投递不会让金额翻倍」；目标表的 upsert 带 LSN
+                守卫，重跑时旧位点全部 no-op，物理内容保持唯一。
               </div>
             </div>
           </div>
         </div>
       </div>
+
+      <TargetPublishPanel publish={publish} rowsBefore={run.target_rows_before} rowsAfter={run.target_rows_after} />
 
       {counts ? (
         <div className="section">

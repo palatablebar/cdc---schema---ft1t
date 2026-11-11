@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS {DW}.orders_dw (
     amount        numeric(14,2),
     qty           integer,
     status        text,
-    updated_at    timestamp
+    updated_at    timestamp,
+    _merge_lsn    bigint
 );
 
 CREATE TABLE IF NOT EXISTS {DW}.customers_dw (
@@ -32,7 +33,8 @@ CREATE TABLE IF NOT EXISTS {DW}.customers_dw (
     mobile        text,
     tier          text,
     city          text,
-    updated_at    timestamp
+    updated_at    timestamp,
+    _merge_lsn    bigint
 );
 """
 

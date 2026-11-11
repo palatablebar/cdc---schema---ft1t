@@ -38,6 +38,12 @@ class MergeRun(Base):
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     result_digest: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
     result_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # 数仓发布状态：True=已写入目标表；False=gate 阻塞/未发布；None=尚未进入发布阶段
+    published: Mapped[bool | None] = mapped_column(nullable=True, index=True)
+    # 发布详情（阻塞字段、入库前后行数、目标表快照、LSN 守卫跳过数），结构见 target_publisher
+    publish_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    target_rows_before: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    target_rows_after: Mapped[int | None] = mapped_column(Integer, nullable=True)
     error_message: Mapped[str | None] = mapped_column(String(600), nullable=True)
     celery_task_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, nullable=False, index=True)

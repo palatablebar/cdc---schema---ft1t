@@ -158,6 +158,7 @@ export const RunsPage = () => {
                 <th className="num">重复</th>
                 <th className="num">拒绝</th>
                 <th className="num">落账行</th>
+                <th>数仓入库</th>
                 <th className="num">耗时</th>
                 <th>创建时间</th>
               </tr>
@@ -188,6 +189,19 @@ export const RunsPage = () => {
                       {run.rejected_count}
                     </td>
                     <td className="num">{run.upserted_count}</td>
+                    <td>
+                      {run.published === null ? (
+                        <span className="faint tiny">—</span>
+                      ) : run.published ? (
+                        <span className="pill ok" title={`目标表 ${run.target_rows_before} → ${run.target_rows_after} 行`}>
+                          已入库 {run.target_rows_before ?? '?'}→{run.target_rows_after ?? '?'}
+                        </span>
+                      ) : (
+                        <span className="pill danger" title={run.error_message ?? '整窗未发布'}>
+                          未发布
+                        </span>
+                      )}
+                    </td>
                     <td className="num">{formatMs(run.duration_ms)}</td>
                     <td className="tiny faint">{formatShortTime(run.created_at)}</td>
                   </tr>

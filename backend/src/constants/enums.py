@@ -29,10 +29,17 @@ class RunStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELED = "canceled"
+    # 归并计算完成，但 schema gate 判定整窗与目标表不兼容，未发布任何数据
+    BLOCKED = "blocked"
 
     @classmethod
     def terminal(cls) -> set[str]:
-        return {cls.SUCCEEDED.value, cls.FAILED.value, cls.CANCELED.value}
+        return {
+            cls.SUCCEEDED.value,
+            cls.FAILED.value,
+            cls.CANCELED.value,
+            cls.BLOCKED.value,
+        }
 
 
 class RejectReason(str, Enum):
@@ -102,6 +109,7 @@ ENUM_LABELS: dict[str, dict[str, str]] = {
         "succeeded": "成功",
         "failed": "失败",
         "canceled": "已取消",
+        "blocked": "阻塞未发布",
     },
     "RejectReason": {
         "schema_mismatch": "schema 不匹配",

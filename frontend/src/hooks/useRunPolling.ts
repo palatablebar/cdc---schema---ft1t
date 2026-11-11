@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { runApi } from '../api/run';
 import type { MergeRun } from '../types/models';
 
-const TERMINAL = new Set(['succeeded', 'failed', 'canceled']);
+const TERMINAL = new Set(['succeeded', 'failed', 'canceled', 'blocked']);
 
 /** 运行未终结时每 1.2s 轮询一次；终结即停，不在前端算任何结果。 */
 export const useRunPolling = (initial: MergeRun | null, onUpdate?: (run: MergeRun) => void) => {
